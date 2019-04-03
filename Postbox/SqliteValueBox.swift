@@ -346,12 +346,12 @@ final class SqliteValueBox: ValueBox {
             switch table.keyType {
                 case .binary:
                     var resultCode: Bool
-                    resultCode = self.database.execute("CREATE TABLE t\(table.id) (key BLOB, value BLOB)")
+                    resultCode = self.database.execute("CREATE TABLE IF NOT EXISTS t\(table.id) (key BLOB, value BLOB)")
                     assert(resultCode)
-                    resultCode = self.database.execute("CREATE INDEX t\(table.id)_key ON t\(table.id) (key)")
+                    resultCode = self.database.execute("CREATE INDEX IF NOT EXISTS t\(table.id)_key ON t\(table.id) (key)")
                     assert(resultCode)
                 case .int64:
-                    let resultCode = self.database.execute("CREATE TABLE t\(table.id) (key INTEGER PRIMARY KEY, value BLOB)")
+                    let resultCode = self.database.execute("CREATE TABLE IF NOT EXISTS t\(table.id) (key INTEGER PRIMARY KEY, value BLOB)")
                     assert(resultCode)
             }
             self.tables[table.id] = table
