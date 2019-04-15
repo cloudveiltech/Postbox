@@ -527,10 +527,11 @@ public final class Transaction {
         return nil
     }
     
-    public func searchItemCollection(namespace: ItemCollectionId.Namespace, key: MemoryBuffer) -> [ItemCollectionItem] {
+    
+    public func searchItemCollection(namespace: ItemCollectionId.Namespace, query: ItemCollectionSearchQuery) -> [ItemCollectionItem] {
         assert(!self.disposed)
         if let postbox = self.postbox {
-            let itemsByCollectionId = postbox.itemCollectionItemTable.exactIndexedItems(namespace: namespace, key: ValueBoxKey(key))
+            let itemsByCollectionId = postbox.itemCollectionItemTable.searchIndexedItems(namespace: namespace, query: query)
             let infoIds = postbox.itemCollectionInfoTable.getIds(namespace: namespace)
             var infoIndices: [ItemCollectionId: Int] = [:]
             for i in 0 ..< infoIds.count {
@@ -916,6 +917,11 @@ public final class Transaction {
         return self.postbox?.deviceContactImportInfoTable.getIdentifiers() ?? []
     }
     
+    public func clearDeviceContactImportInfoIdentifiers() {
+        assert(!self.disposed)
+        self.postbox?.clearDeviceContactImportInfoIdentifiers()
+    }
+    
     public func enumerateDeviceContactImportInfoItems(_ f: (ValueBoxKey, PostboxCoding) -> Bool) {
         assert(!self.disposed)
         self.postbox?.deviceContactImportInfoTable.enumerateDeviceContactImportInfoItems(f)
@@ -955,7 +961,7 @@ fileprivate class PipeNotifier: NSObject {
 }
 
 public enum PostboxResult {
-    case upgrading
+    case upgrading(Float)
     case postbox(Postbox)
 }
 
@@ -983,7 +989,7 @@ func debugRestoreState(basePath:String, name: String) {
     }
 }
 
-public func openPostbox(basePath: String, globalMessageIdsNamespace: MessageId.Namespace, seedConfiguration: SeedConfiguration) -> Signal<PostboxResult, NoError> {
+public func openPostbox(basePath: String, seedConfiguration: SeedConfiguration) -> Signal<PostboxResult, NoError> {
     let queue = Queue(name: "org.telegram.postbox.Postbox")
     return Signal { subscriber in
         queue.async {
@@ -1000,7 +1006,7 @@ public func openPostbox(basePath: String, globalMessageIdsNamespace: MessageId.N
                 let metadataTable = MetadataTable(valueBox: valueBox, table: MetadataTable.tableSpec(0))
                 
                 let userVersion: Int32? = metadataTable.userVersion()
-                let currentUserVersion: Int32 = 18
+                let currentUserVersion: Int32 = 20
                 
                 if let userVersion = userVersion {
                     if userVersion != currentUserVersion {
@@ -1028,7 +1034,7 @@ public func openPostbox(basePath: String, globalMessageIdsNamespace: MessageId.N
                     metadataTable.setUserVersion(currentUserVersion)
                 }
                 
-                subscriber.putNext(.postbox(Postbox(queue: queue, basePath: basePath, globalMessageIdsNamespace: globalMessageIdsNamespace, seedConfiguration: seedConfiguration, valueBox: valueBox)))
+                subscriber.putNext(.postbox(Postbox(queue: queue, basePath: basePath, seedConfiguration: seedConfiguration, valueBox: valueBox)))
                 subscriber.putCompletion()
                 break
             }
@@ -1042,7 +1048,6 @@ public final class Postbox {
     private let queue: Queue
     public let seedConfiguration: SeedConfiguration
     private let basePath: String
-    private let globalMessageIdsNamespace: MessageId.Namespace
     private let valueBox: ValueBox
     
     private let ipcNotificationsDisposable = MetaDisposable()
@@ -1180,14 +1185,13 @@ public final class Postbox {
     
     var installedMessageActionsByPeerId: [PeerId: Bag<([StoreMessage], Transaction) -> Void>] = [:]
     
-    fileprivate init(queue: Queue, basePath: String, globalMessageIdsNamespace: MessageId.Namespace, seedConfiguration: SeedConfiguration, valueBox: ValueBox) {
+    fileprivate init(queue: Queue, basePath: String, seedConfiguration: SeedConfiguration, valueBox: ValueBox) {
         assert(queue.isCurrent())
         
         let startTime = CFAbsoluteTimeGetCurrent()
         
         self.queue = queue
         self.basePath = basePath
-        self.globalMessageIdsNamespace = globalMessageIdsNamespace
         self.seedConfiguration = seedConfiguration
         
         print("MediaBox path: \(self.basePath + "/media")")
@@ -1211,7 +1215,7 @@ public final class Postbox {
         self.keychainTable = KeychainTable(valueBox: self.valueBox, table: KeychainTable.tableSpec(1))
         self.reverseAssociatedPeerTable = ReverseAssociatedPeerTable(valueBox: self.valueBox, table:ReverseAssociatedPeerTable.tableSpec(40))
         self.peerTable = PeerTable(valueBox: self.valueBox, table: PeerTable.tableSpec(2), reverseAssociatedTable: self.reverseAssociatedPeerTable)
-        self.globalMessageIdsTable = GlobalMessageIdsTable(valueBox: self.valueBox, table: GlobalMessageIdsTable.tableSpec(3), namespace: self.globalMessageIdsNamespace)
+        self.globalMessageIdsTable = GlobalMessageIdsTable(valueBox: self.valueBox, table: GlobalMessageIdsTable.tableSpec(3), seedConfiguration: seedConfiguration)
         self.globallyUniqueMessageIdsTable = MessageGloballyUniqueIdTable(valueBox: self.valueBox, table: MessageGloballyUniqueIdTable.tableSpec(32))
         self.messageHistoryMetadataTable = MessageHistoryMetadataTable(valueBox: self.valueBox, table: MessageHistoryMetadataTable.tableSpec(10))
         self.messageHistoryUnsentTable = MessageHistoryUnsentTable(valueBox: self.valueBox, table: MessageHistoryUnsentTable.tableSpec(11))
@@ -1348,40 +1352,38 @@ public final class Postbox {
         
         print("(Postbox initialization took \((CFAbsoluteTimeGetCurrent() - startTime) * 1000.0) ms")
         
-        for id in self.messageHistoryUnsentTable.get() {
-            self.updateMessage(id, update: { message in
-                if !message.flags.contains(.Failed) {
-                    var flags = StoreMessageFlags(message.flags)
-                    flags.remove(.Unsent)
-                    flags.remove(.Sending)
-                    flags.insert(.Failed)
-                    var storeForwardInfo: StoreMessageForwardInfo?
-                    if let forwardInfo = message.forwardInfo {
-                        storeForwardInfo = StoreMessageForwardInfo(authorId: forwardInfo.author.id, sourceId: forwardInfo.source?.id, sourceMessageId: forwardInfo.sourceMessageId, date: forwardInfo.date, authorSignature: forwardInfo.authorSignature)
-                    }
-                    return .update(StoreMessage(id: message.id, globallyUniqueId: message.globallyUniqueId, groupingKey: message.groupingKey, timestamp: message.timestamp, flags: flags, tags: message.tags, globalTags: message.globalTags, localTags: message.localTags, forwardInfo: storeForwardInfo, authorId: message.author?.id, text: message.text, attributes: message.attributes, media: message.media))
-                } else {
-                    return .skip
-                }
-            })
-        }
-        
-        do {
-            /*let startTime = CFAbsoluteTimeGetCurrent()
-            let state = self.chatListIndexTable.debugReindexUnreadCounts(postbox: self)
-            if state != self.messageHistoryMetadataTable.getChatListTotalUnreadState() {
-                print("Initial read state mismatch")
+        let _ = self.transaction({ transaction -> Void in
+            if self.messageHistoryMetadataTable.shouldReindexUnreadCounts() {
+                let startTime = CFAbsoluteTimeGetCurrent()
+                let state = self.chatListIndexTable.debugReindexUnreadCounts(postbox: self)
                 self.messageHistoryMetadataTable.setChatListTotalUnreadState(state)
-            }*/
-            postboxLog("debugReindexUnreadCounts took \(CFAbsoluteTimeGetCurrent() - startTime)")
-        }
+                postboxLog("reindexUnreadCounts took \(CFAbsoluteTimeGetCurrent() - startTime)")
+                self.messageHistoryMetadataTable.setShouldReindexUnreadCounts(value: false)
+            }
+            
+            for id in self.messageHistoryUnsentTable.get() {
+                transaction.updateMessage(id, update: { message in
+                    if !message.flags.contains(.Failed) {
+                        var flags = StoreMessageFlags(message.flags)
+                        flags.remove(.Unsent)
+                        flags.remove(.Sending)
+                        flags.insert(.Failed)
+                        var storeForwardInfo: StoreMessageForwardInfo?
+                        if let forwardInfo = message.forwardInfo {
+                            storeForwardInfo = StoreMessageForwardInfo(authorId: forwardInfo.author?.id, sourceId: forwardInfo.source?.id, sourceMessageId: forwardInfo.sourceMessageId, date: forwardInfo.date, authorSignature: forwardInfo.authorSignature)
+                        }
+                        return .update(StoreMessage(id: message.id, globallyUniqueId: message.globallyUniqueId, groupingKey: message.groupingKey, timestamp: message.timestamp, flags: flags, tags: message.tags, globalTags: message.globalTags, localTags: message.localTags, forwardInfo: storeForwardInfo, authorId: message.author?.id, text: message.text, attributes: message.attributes, media: message.media))
+                    } else {
+                        return .skip
+                    }
+                })
+            }
+        }).start()
     }
     
     deinit {
         assert(true)
     }
-    
-   
     
     private func takeNextViewId() -> Int {
         let nextId = self.nextViewId
@@ -2599,7 +2601,7 @@ public final class Postbox {
                             assertionFailure()
                         }
                     } else {
-                        assertionFailure()
+                        //assertionFailure()
                     }
                 } else {
                     let item: MessageHistoryTopTaggedMessage? = nil
@@ -3483,6 +3485,13 @@ public final class Postbox {
                 default:
                     return nil
             }
+        }
+    }
+    
+    fileprivate func clearDeviceContactImportInfoIdentifiers() {
+        let identifiers = self.deviceContactImportInfoTable.getIdentifiers()
+        for identifier in identifiers {
+            self.deviceContactImportInfoTable.set(identifier, value: nil)
         }
     }
     
