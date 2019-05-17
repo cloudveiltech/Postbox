@@ -222,14 +222,14 @@ final class SqliteValueBox: ValueBox {
             assert(resultCode)
             resultCode = database.execute("DROP TABLE IF EXISTS __meta_tables")
             assert(resultCode)
-            resultCode = database.execute("CREATE TABLE __meta_tables (name INTEGER, keyType INTEGER)")
+            resultCode = database.execute("CREATE TABLE IF NOT EXISTS __meta_tables (name INTEGER, keyType INTEGER)")
             assert(resultCode)
-            resultCode = database.execute("CREATE TABLE __meta_fulltext_tables (name INTEGER)")
+            resultCode = database.execute("CREATE TABLE IF NOT EXISTS __meta_fulltext_tables (name INTEGER)")
             assert(resultCode)
         } else if result < 3 {
             resultCode = database.execute("PRAGMA user_version=3")
             assert(resultCode)
-            resultCode = database.execute("CREATE TABLE __meta_fulltext_tables (name INTEGER)")
+            resultCode = database.execute("CREATE TABLE IF NOT EXISTS __meta_fulltext_tables (name INTEGER)")
             assert(resultCode)
         }
         
